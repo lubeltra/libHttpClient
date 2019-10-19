@@ -8,219 +8,28 @@
 namespace
 {
 
-class AsyncWrapper
-{
-public:
-    enum class State
-    {
-        Created,
-        Polling,
-        PendingPoll,
-        PendingCallback,
-        Complete,
-    };
+// This code provides 2 class templates called AsyncRunnableBase and
+// AsyncRunnableStatelessBase which help implment XAsync providers easily.
+// The main goal of the design is to minimize the amount of boilerplate and edge
+// cases each provider needs to implement.
 
-    AsyncWrapper(_In_ XAsyncBlock* async, size_t rsize, State s):
-        m_async{ async }, m_resultSize{ rsize }, m_state{ s }
-    {}
+// In both cases the client is supposed to define a class that derives from one
+// of the 2 bases and provide at least Begin and DoWork methods (which are
+// are called when servicing that specific XAsyncOp).
 
-    HRESULT MarkWaitingOnCallback() noexcept
-    {
-        assert(m_state == State::Polling);
-
-        m_state = State::PendingCallback;
-        return S_OK;
-    }
-
-    HRESULT ScheduleOnQueue() noexcept
-    {
-        return ScheduleOnQueueAfter({});
-    }
-
-    HRESULT ScheduleOnQueueAfter(std::chrono::milliseconds d) noexcept
-    {
-        assert(m_state == State::Polling);
-        HRESULT hr = XAsyncSchedule(m_async, static_cast<uint32_t>(d.count()));
-        if (FAILED(hr))
-        {
-            return hr;
-        }
-
-        m_state = State::PendingPoll;
-        return S_OK;
-    }
-
-    HRESULT Succeed() noexcept
-    {
-        return SucceedWithResultSize(m_resultSize);
-    }
-
-    HRESULT SucceedWithResultSize(size_t size) noexcept
-    {
-        assert(m_state == State::Polling);
-
-        m_state = State::Complete;
-        XAsyncComplete(m_async, S_OK, size);
-
-        return S_OK;
-    }
-
-    State GetState() const noexcept
-    {
-        return m_state;
-    }
-
-    XAsyncBlock* GetRaw() const noexcept
-    {
-        return m_async;
-    }
-
-private:
-    XAsyncBlock* const m_async; // non owning
-    size_t const m_resultSize;
-    State m_state;
-};
-
-template<class T>
-struct SizeOfHelper
-{
-    static constexpr size_t value = sizeof(T);
-};
-
-template<>
-struct SizeOfHelper<void>
-{
-    static constexpr size_t value = 0;
-};
-
-template<class TDerived, class TContext, class TResult>
-class AsyncRunnableStatelessBase
-{
-public:
-    static HRESULT Run(
-        _In_opt_ void* identity,
-        _In_opt_z_ char const* identityName,
-        _In_ XAsyncBlock* async,
-        _In_ TContext* ctx
-    ) noexcept
-    {
-        return XAsyncBegin(async, ctx, identity, identityName, &AsyncRunnableStatelessBase::Provider);
-    }
-
-protected:
-
-protected: // default impls
-    static void GetResult(TContext*, size_t, void*)
-    {
-        assert(false);
-    }
-    static void Cancel(TContext*) {}
-    static void Cleanup(TContext*) {}
-
-private:
-    static HRESULT Provider(XAsyncOp op, _In_ XAsyncProviderData const* data) noexcept
-    {
-        static_assert(std::is_base_of<AsyncRunnableStatelessBase<TDerived, TContext, TResult>, TDerived>::value,
-            "TDerived must be the class deriving from AsyncRunnableStatelessBase");
-
-        auto ctx = static_cast<TContext*>(data->context);
-
-        switch (op)
-        {
-        case XAsyncOp::Begin:
-            try
-            {
-                AsyncWrapper aw{ data->async, SizeOfHelper<TResult>::value, AsyncWrapper::State::Polling };
-
-                HRESULT hr = TDerived::Begin(ctx, aw);
-                if (FAILED(hr))
-                {
-                    return hr;
-                }
-
-                if (aw.GetState() == AsyncWrapper::State::Polling)
-                {
-                    assert(false); // forgot to complete or schedule again
-                    return E_UNEXPECTED;
-                }
-
-                return S_OK;
-            }
-            catch (...) // needs good catch return setup
-            {
-                return E_FAIL;
-            }
-        case XAsyncOp::DoWork:
-            try
-            {
-                AsyncWrapper aw{ data->async, SizeOfHelper<TResult>::value, AsyncWrapper::State::Polling };
-
-                HRESULT hr = TDerived::DoWork(ctx, aw);
-                if (FAILED(hr))
-                {
-                    assert(hr != E_PENDING); // DoWork should never return E_PENDING
-                    XAsyncComplete(data->async, hr, 0);
-                    return S_OK;
-                }
-
-                switch (aw.GetState())
-                {
-                case AsyncWrapper::State::Created:
-                    assert(false); // this cannot happen
-                    return E_UNEXPECTED;
-                case AsyncWrapper::State::Polling:
-                    assert(false); // forgot to complete or schedule again
-                    XAsyncComplete(data->async, E_UNEXPECTED, 0);
-                    return S_OK;
-                case AsyncWrapper::State::PendingPoll:
-                case AsyncWrapper::State::PendingCallback:
-                    return E_PENDING;
-                case AsyncWrapper::State::Complete:
-                    return S_OK;
-                }
-            }
-            catch (...) // needs good catch return setup
-            {
-                XAsyncComplete(data->async, E_FAIL, 0);
-                return S_OK;
-            }
-        case XAsyncOp::GetResult:
-            try
-            {
-                TDerived::GetResult(ctx, data->bufferSize, static_cast<TResult*>(data->buffer));
-                return S_OK;
-            }
-            catch (...) // needs good catch return setup
-            {
-                // this seems really bad, is get result allowed to fail?
-                return E_FAIL;
-            }
-        case XAsyncOp::Cancel:
-            try
-            {
-                TDerived::Cancel(ctx);
-                return S_OK;
-            }
-            catch (...) // needs good catch return setup
-            {
-                // what to do here? let's assume the task will still complete normally
-                assert(false);
-                return S_OK;
-            }
-        case XAsyncOp::Cleanup:
-            // cleanup most definitely should be no fail, die hard on exceptions
-            {
-                TDerived::Cleanup(ctx);
-                return S_OK;
-            }
-        }
-
-        // VS can't quite tell that we should always return early
-        assert(false);
-        return E_UNEXPECTED;
-    }
-};
-
+// XAsyncRunnableBase is the general purpose helper. It allocates an instance of
+// the derived class and passes it down as the provider context, so the client
+// can store arbitrary data (which can be passed to its constructor via
+// MakeAndRun).
+// The client can implement the following 4 provider operations as methods:
+// - Begin
+// - DoWork
+// - GetResult (provided for clients returning void)
+// - Cancel (optional)
+// The destructor will be called in XAsyncOp::Cleanup to free resources.
+// There are a number of protected methods that allow the client to schedule and
+// complete the async operation (failure is always signalled by returning an
+// error code from one of the provider methods)
 template <class TDerived, class TResult>
 class AsyncRunnableBase
 {
@@ -442,6 +251,234 @@ private:
 
     State m_state = State::Created;
     XAsyncBlock* m_async;
+};
+
+// Helper for AsyncRunnableStatelessBase
+class AsyncWrapper
+{
+public:
+    enum class State
+    {
+        Created,
+        Polling,
+        PendingPoll,
+        PendingCallback,
+        Complete,
+    };
+
+    AsyncWrapper(_In_ XAsyncBlock* async, size_t rsize, State s):
+        m_async{ async }, m_resultSize{ rsize }, m_state{ s }
+    {}
+
+    HRESULT MarkWaitingOnCallback() noexcept
+    {
+        assert(m_state == State::Polling);
+
+        m_state = State::PendingCallback;
+        return S_OK;
+    }
+
+    HRESULT ScheduleOnQueue() noexcept
+    {
+        return ScheduleOnQueueAfter({});
+    }
+
+    HRESULT ScheduleOnQueueAfter(std::chrono::milliseconds d) noexcept
+    {
+        assert(m_state == State::Polling);
+        HRESULT hr = XAsyncSchedule(m_async, static_cast<uint32_t>(d.count()));
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        m_state = State::PendingPoll;
+        return S_OK;
+    }
+
+    HRESULT Succeed() noexcept
+    {
+        return SucceedWithResultSize(m_resultSize);
+    }
+
+    HRESULT SucceedWithResultSize(size_t size) noexcept
+    {
+        assert(m_state == State::Polling);
+
+        m_state = State::Complete;
+        XAsyncComplete(m_async, S_OK, size);
+
+        return S_OK;
+    }
+
+    State GetState() const noexcept
+    {
+        return m_state;
+    }
+
+    XAsyncBlock* GetRaw() const noexcept
+    {
+        return m_async;
+    }
+
+private:
+    XAsyncBlock* const m_async; // non owning
+    size_t const m_resultSize;
+    State m_state;
+};
+
+template<class T>
+struct SizeOfHelper
+{
+    static constexpr size_t value = sizeof(T);
+};
+
+template<>
+struct SizeOfHelper<void>
+{
+    static constexpr size_t value = 0;
+};
+
+// AsyncRunnableStatelessBase is a specialized helper for building providers
+// that do not own their context. Unlike AsyncRunnableBase it does not allocate
+// at all, relying on the TContext* object to carry any information it needs.
+// The client can implement the following 5 provider operations as static
+// methods:
+// - Begin
+// - DoWork
+// - GetResult (provided for clients returning void)
+// - Cancel (optional)
+// - Cleanup (optional)
+// Each of these methods is passed a pointer to the context. Begin and DoWork
+// are also given an AsyncWrapper object (by reference) which can be used to
+// schedule or complete the operation (like AsyncRunnableBase, returning an
+// error code will fail the operation).
+template<class TDerived, class TContext, class TResult>
+class AsyncRunnableStatelessBase
+{
+public:
+    static HRESULT Run(
+        _In_opt_ void* identity,
+        _In_opt_z_ char const* identityName,
+        _In_ XAsyncBlock* async,
+        _In_ TContext* ctx
+    ) noexcept
+    {
+        return XAsyncBegin(async, ctx, identity, identityName, &AsyncRunnableStatelessBase::Provider);
+    }
+
+protected:
+
+protected: // default impls
+    static void GetResult(TContext*, size_t, void*)
+    {
+        assert(false);
+    }
+    static void Cancel(TContext*) {}
+    static void Cleanup(TContext*) {}
+
+private:
+    static HRESULT Provider(XAsyncOp op, _In_ XAsyncProviderData const* data) noexcept
+    {
+        static_assert(std::is_base_of<AsyncRunnableStatelessBase<TDerived, TContext, TResult>, TDerived>::value,
+            "TDerived must be the class deriving from AsyncRunnableStatelessBase");
+
+        auto ctx = static_cast<TContext*>(data->context);
+
+        switch (op)
+        {
+        case XAsyncOp::Begin:
+            try
+            {
+                AsyncWrapper aw{ data->async, SizeOfHelper<TResult>::value, AsyncWrapper::State::Polling };
+
+                HRESULT hr = TDerived::Begin(ctx, aw);
+                if (FAILED(hr))
+                {
+                    return hr;
+                }
+
+                if (aw.GetState() == AsyncWrapper::State::Polling)
+                {
+                    assert(false); // forgot to complete or schedule again
+                    return E_UNEXPECTED;
+                }
+
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                return E_FAIL;
+            }
+        case XAsyncOp::DoWork:
+            try
+            {
+                AsyncWrapper aw{ data->async, SizeOfHelper<TResult>::value, AsyncWrapper::State::Polling };
+
+                HRESULT hr = TDerived::DoWork(ctx, aw);
+                if (FAILED(hr))
+                {
+                    assert(hr != E_PENDING); // DoWork should never return E_PENDING
+                    XAsyncComplete(data->async, hr, 0);
+                    return S_OK;
+                }
+
+                switch (aw.GetState())
+                {
+                case AsyncWrapper::State::Created:
+                    assert(false); // this cannot happen
+                    return E_UNEXPECTED;
+                case AsyncWrapper::State::Polling:
+                    assert(false); // forgot to complete or schedule again
+                    XAsyncComplete(data->async, E_UNEXPECTED, 0);
+                    return S_OK;
+                case AsyncWrapper::State::PendingPoll:
+                case AsyncWrapper::State::PendingCallback:
+                    return E_PENDING;
+                case AsyncWrapper::State::Complete:
+                    return S_OK;
+                }
+            }
+            catch (...) // needs good catch return setup
+            {
+                XAsyncComplete(data->async, E_FAIL, 0);
+                return S_OK;
+            }
+        case XAsyncOp::GetResult:
+            try
+            {
+                TDerived::GetResult(ctx, data->bufferSize, static_cast<TResult*>(data->buffer));
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                // this seems really bad, is get result allowed to fail?
+                return E_FAIL;
+            }
+        case XAsyncOp::Cancel:
+            try
+            {
+                TDerived::Cancel(ctx);
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                // what to do here? let's assume the task will still complete normally
+                assert(false);
+                return S_OK;
+            }
+        case XAsyncOp::Cleanup:
+            // cleanup most definitely should be no fail, die hard on exceptions
+            {
+                TDerived::Cleanup(ctx);
+                return S_OK;
+            }
+        }
+
+        // VS can't quite tell that we should always return early
+        assert(false);
+        return E_UNEXPECTED;
+    }
 };
 
 }
