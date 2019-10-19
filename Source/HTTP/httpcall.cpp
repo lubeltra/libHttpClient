@@ -5,6 +5,484 @@
 #include "httpcall.h"
 #include "../Mock/lhc_mock.h"
 
+namespace
+{
+
+// This code provides 2 class templates called AsyncRunnableBase and
+// AsyncRunnableStatelessBase which help implment XAsync providers easily.
+// The main goal of the design is to minimize the amount of boilerplate and edge
+// cases each provider needs to implement.
+
+// In both cases the client is supposed to define a class that derives from one
+// of the 2 bases and provide at least Begin and DoWork methods (which are
+// are called when servicing that specific XAsyncOp).
+
+// XAsyncRunnableBase is the general purpose helper. It allocates an instance of
+// the derived class and passes it down as the provider context, so the client
+// can store arbitrary data (which can be passed to its constructor via
+// MakeAndRun).
+// The client can implement the following 4 provider operations as methods:
+// - Begin
+// - DoWork
+// - GetResult (provided for clients returning void)
+// - Cancel (optional)
+// The destructor will be called in XAsyncOp::Cleanup to free resources.
+// There are a number of protected methods that allow the client to schedule and
+// complete the async operation (failure is always signalled by returning an
+// error code from one of the provider methods)
+template <class TDerived, class TResult>
+class AsyncRunnableBase
+{
+public:
+    // split to allow other memory management strategies?
+    template<class... TArgs>
+    static HRESULT MakeAndRun(
+        _In_opt_ void* identity,
+        _In_opt_z_ char const* identityName,
+        _In_ XAsyncBlock* async,
+        TArgs&&... args
+    ) noexcept
+    {
+        try
+        {
+            auto self = std::make_unique<TDerived>(std::forward<TArgs>(args)...);
+            HRESULT hr = XAsyncBegin(async, self.get(), identity, identityName, &AsyncRunnableBase::Provider);
+            if (FAILED(hr))
+            {
+                return hr;
+            }
+
+            self.release();
+            return S_OK;
+        }
+        catch (std::bad_alloc)
+        {
+            return E_OUTOFMEMORY;
+        }
+        catch (...) // needs good catch return setup
+        {
+            return E_FAIL;
+        }
+    }
+
+protected:
+
+    HRESULT MarkWaitingOnCallback() noexcept
+    {
+        assert(m_state == State::Polling);
+
+        m_state = State::PendingCallback;
+        return S_OK;
+    }
+
+    HRESULT ScheduleOnQueue() noexcept
+    {
+        return ScheduleOnQueueAfter({});
+    }
+
+    HRESULT ScheduleOnQueueAfter(std::chrono::milliseconds d) noexcept
+    {
+        assert(m_state == State::Polling);
+        HRESULT hr = XAsyncSchedule(m_async, static_cast<uint32_t>(d.count()));
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        m_state = State::PendingPoll;
+        return S_OK;
+    }
+
+    HRESULT Succeed() noexcept
+    {
+        return SucceedWithResultSize(SizeOfHelper<TResult>::value);
+    }
+
+    HRESULT SucceedWithResultSize(size_t size) noexcept
+    {
+        assert(m_state == State::Polling || m_state == State::PendingCallback);
+
+        m_state = State::Complete;
+        XAsyncComplete(m_async, S_OK, size);
+
+        return S_OK;
+    }
+
+    HRESULT Fail(HRESULT hr) noexcept
+    {
+        assert(FAILED(hr));
+        assert(m_state == State::PendingCallback); // don't call Fail from DoWork, just return the failure instead
+
+        m_state = State::Complete;
+        XAsyncComplete(m_async, hr, 0);
+
+        return S_OK;
+    }
+
+protected: // Default impls
+    void GetResult(size_t, void*)
+    {
+        assert(false);
+    }
+    void Cancel() {}
+
+private:
+    using State = AsyncWrapper::State;
+
+    static HRESULT Provider(XAsyncOp op, _In_ XAsyncProviderData const* data) noexcept
+    {
+        static_assert(std::is_base_of<AsyncRunnableBase<TDerived, TResult>, TDerived>::value,
+            "TDerived must be the class deriving from AsyncRunnableBase");
+
+        auto self = static_cast<AsyncRunnableBase*>(data->context);
+        assert(self);
+        self->m_async = data->async;
+
+        switch (op)
+        {
+        case XAsyncOp::Begin:
+            try
+            {
+                assert(self->m_state == State::Created);
+                self->m_state = State::Polling;
+
+                HRESULT hr = self->AsDerived()->Begin();
+                if (FAILED(hr))
+                {
+                    self->m_state = State::Complete;
+                    return hr;
+                }
+
+                if (self->m_state == State::Polling)
+                {
+                    assert(false);
+                    self->m_state = State::Complete;
+                    return E_FAIL;
+                }
+
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                self->m_state = State::Complete;
+                return E_FAIL;
+            }
+        case XAsyncOp::DoWork:
+            try
+            {
+                assert(self->m_state == State::PendingPoll);
+                self->m_state = State::Polling;
+
+                HRESULT hr = self->AsDerived()->DoWork();
+                if (FAILED(hr))
+                {
+                    self->m_state = State::Complete;
+                    XAsyncComplete(data->async, hr, 0);
+                    return S_OK;
+                }
+
+                switch (self->m_state)
+                {
+                case AsyncWrapper::State::Created:
+                    assert(false); // this cannot happen
+                    return E_UNEXPECTED;
+                case AsyncWrapper::State::Polling:
+                    assert(false); // forgot to complete or schedule again
+                    self->m_state = State::Complete;
+                    XAsyncComplete(data->async, E_UNEXPECTED, 0);
+                    return E_FAIL;
+                case AsyncWrapper::State::PendingPoll:
+                case AsyncWrapper::State::PendingCallback:
+                    return E_PENDING;
+                case AsyncWrapper::State::Complete:
+                    return S_OK;
+                }
+            }
+            catch (...) // needs good catch return setup
+            {
+                self->m_state = State::Complete;
+                XAsyncComplete(data->async, E_FAIL, 0);
+                return S_OK;
+            }
+        case XAsyncOp::GetResult:
+            try
+            {
+                assert(self->m_state == State::Complete);
+                self->AsDerived()->GetResult(data->bufferSize, static_cast<TResult*>(data->buffer));
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                // this seems really bad, is get result allowed to fail?
+                return E_UNEXPECTED;
+            }
+        case XAsyncOp::Cancel:
+            try
+            {
+                self->AsDerived()->Cancel();
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                // what to do here? let's assume the task will still complete normally
+                assert(false);
+                return S_OK;
+            }
+        case XAsyncOp::Cleanup:
+            // cleanup most definitely should be no fail, die hard on exceptions
+            {
+                assert(self->m_state == State::Complete);
+
+                // take ownership of self
+                std::unique_ptr<TDerived>{ self->AsDerived() };
+                return S_OK;
+            }
+        }
+
+        // VS can't quite tell that we should always return early
+        assert(false);
+        return E_UNEXPECTED;
+    }
+
+    TDerived* AsDerived() noexcept
+    {
+        return static_cast<TDerived*>(this);
+    }
+
+    State m_state = State::Created;
+    XAsyncBlock* m_async;
+};
+
+// Helper for AsyncRunnableStatelessBase
+class AsyncWrapper
+{
+public:
+    enum class State
+    {
+        Created,
+        Polling,
+        PendingPoll,
+        PendingCallback,
+        Complete,
+    };
+
+    AsyncWrapper(_In_ XAsyncBlock* async, size_t rsize, State s):
+        m_async{ async }, m_resultSize{ rsize }, m_state{ s }
+    {}
+
+    HRESULT MarkWaitingOnCallback() noexcept
+    {
+        assert(m_state == State::Polling);
+
+        m_state = State::PendingCallback;
+        return S_OK;
+    }
+
+    HRESULT ScheduleOnQueue() noexcept
+    {
+        return ScheduleOnQueueAfter({});
+    }
+
+    HRESULT ScheduleOnQueueAfter(std::chrono::milliseconds d) noexcept
+    {
+        assert(m_state == State::Polling);
+        HRESULT hr = XAsyncSchedule(m_async, static_cast<uint32_t>(d.count()));
+        if (FAILED(hr))
+        {
+            return hr;
+        }
+
+        m_state = State::PendingPoll;
+        return S_OK;
+    }
+
+    HRESULT Succeed() noexcept
+    {
+        return SucceedWithResultSize(m_resultSize);
+    }
+
+    HRESULT SucceedWithResultSize(size_t size) noexcept
+    {
+        assert(m_state == State::Polling);
+
+        m_state = State::Complete;
+        XAsyncComplete(m_async, S_OK, size);
+
+        return S_OK;
+    }
+
+    State GetState() const noexcept
+    {
+        return m_state;
+    }
+
+    XAsyncBlock* GetRaw() const noexcept
+    {
+        return m_async;
+    }
+
+private:
+    XAsyncBlock* const m_async; // non owning
+    size_t const m_resultSize;
+    State m_state;
+};
+
+template<class T>
+struct SizeOfHelper
+{
+    static constexpr size_t value = sizeof(T);
+};
+
+template<>
+struct SizeOfHelper<void>
+{
+    static constexpr size_t value = 0;
+};
+
+// AsyncRunnableStatelessBase is a specialized helper for building providers
+// that do not own their context. Unlike AsyncRunnableBase it does not allocate
+// at all, relying on the TContext* object to carry any information it needs.
+// The client can implement the following 5 provider operations as static
+// methods:
+// - Begin
+// - DoWork
+// - GetResult (provided for clients returning void)
+// - Cancel (optional)
+// - Cleanup (optional)
+// Each of these methods is passed a pointer to the context. Begin and DoWork
+// are also given an AsyncWrapper object (by reference) which can be used to
+// schedule or complete the operation (like AsyncRunnableBase, returning an
+// error code will fail the operation).
+template<class TDerived, class TContext, class TResult>
+class AsyncRunnableStatelessBase
+{
+public:
+    static HRESULT Run(
+        _In_opt_ void* identity,
+        _In_opt_z_ char const* identityName,
+        _In_ XAsyncBlock* async,
+        _In_ TContext* ctx
+    ) noexcept
+    {
+        return XAsyncBegin(async, ctx, identity, identityName, &AsyncRunnableStatelessBase::Provider);
+    }
+
+protected:
+
+protected: // default impls
+    static void GetResult(TContext*, size_t, void*)
+    {
+        assert(false);
+    }
+    static void Cancel(TContext*) {}
+    static void Cleanup(TContext*) {}
+
+private:
+    static HRESULT Provider(XAsyncOp op, _In_ XAsyncProviderData const* data) noexcept
+    {
+        static_assert(std::is_base_of<AsyncRunnableStatelessBase<TDerived, TContext, TResult>, TDerived>::value,
+            "TDerived must be the class deriving from AsyncRunnableStatelessBase");
+
+        auto ctx = static_cast<TContext*>(data->context);
+
+        switch (op)
+        {
+        case XAsyncOp::Begin:
+            try
+            {
+                AsyncWrapper aw{ data->async, SizeOfHelper<TResult>::value, AsyncWrapper::State::Polling };
+
+                HRESULT hr = TDerived::Begin(ctx, aw);
+                if (FAILED(hr))
+                {
+                    return hr;
+                }
+
+                if (aw.GetState() == AsyncWrapper::State::Polling)
+                {
+                    assert(false); // forgot to complete or schedule again
+                    return E_UNEXPECTED;
+                }
+
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                return E_FAIL;
+            }
+        case XAsyncOp::DoWork:
+            try
+            {
+                AsyncWrapper aw{ data->async, SizeOfHelper<TResult>::value, AsyncWrapper::State::Polling };
+
+                HRESULT hr = TDerived::DoWork(ctx, aw);
+                if (FAILED(hr))
+                {
+                    assert(hr != E_PENDING); // DoWork should never return E_PENDING
+                    XAsyncComplete(data->async, hr, 0);
+                    return S_OK;
+                }
+
+                switch (aw.GetState())
+                {
+                case AsyncWrapper::State::Created:
+                    assert(false); // this cannot happen
+                    return E_UNEXPECTED;
+                case AsyncWrapper::State::Polling:
+                    assert(false); // forgot to complete or schedule again
+                    XAsyncComplete(data->async, E_UNEXPECTED, 0);
+                    return S_OK;
+                case AsyncWrapper::State::PendingPoll:
+                case AsyncWrapper::State::PendingCallback:
+                    return E_PENDING;
+                case AsyncWrapper::State::Complete:
+                    return S_OK;
+                }
+            }
+            catch (...) // needs good catch return setup
+            {
+                XAsyncComplete(data->async, E_FAIL, 0);
+                return S_OK;
+            }
+        case XAsyncOp::GetResult:
+            try
+            {
+                TDerived::GetResult(ctx, data->bufferSize, static_cast<TResult*>(data->buffer));
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                // this seems really bad, is get result allowed to fail?
+                return E_FAIL;
+            }
+        case XAsyncOp::Cancel:
+            try
+            {
+                TDerived::Cancel(ctx);
+                return S_OK;
+            }
+            catch (...) // needs good catch return setup
+            {
+                // what to do here? let's assume the task will still complete normally
+                assert(false);
+                return S_OK;
+            }
+        case XAsyncOp::Cleanup:
+            // cleanup most definitely should be no fail, die hard on exceptions
+            {
+                TDerived::Cleanup(ctx);
+                return S_OK;
+            }
+        }
+
+        // VS can't quite tell that we should always return early
+        assert(false);
+        return E_UNEXPECTED;
+    }
+};
+
+}
+
 using namespace xbox::httpclient;
 
 const int MIN_DELAY_FOR_HTTP_INTERNAL_ERROR_IN_MS = 10000;
@@ -99,57 +577,51 @@ HRESULT perform_http_call(
     _Inout_ XAsyncBlock* asyncBlock
     )
 {
-    HRESULT hr = XAsyncBegin(asyncBlock, call, reinterpret_cast<void*>(perform_http_call), __FUNCTION__,
-        [](XAsyncOp opCode, const XAsyncProviderData* data)
+    class Runner : public AsyncRunnableStatelessBase<Runner, HC_CALL, void>
     {
-        auto httpSingleton = get_http_singleton(false);
-        if (nullptr == httpSingleton)
+    public:
+        static HRESULT Begin(HCCallHandle call, AsyncWrapper& aw)
         {
-            return E_HC_NOT_INITIALISED;
-        }
-
-        switch (opCode)
-        {
-            case XAsyncOp::DoWork:
+            auto httpSingleton = get_http_singleton(false);
+            if (nullptr == httpSingleton)
             {
-                HCCallHandle call = static_cast<HCCallHandle>(data->context);
-                bool matchedMocks = false;
-
-                matchedMocks = Mock_Internal_HCHttpCallPerformAsync(call);
-                if (matchedMocks)
-                {
-                    XAsyncComplete(data->async, S_OK, 0);
-                }
-                else // if there wasn't a matched mock, then real call
-                {
-                    HttpPerformInfo const& info = httpSingleton->m_httpPerform;
-                    if (info.handler != nullptr)
-                    {
-                        try
-                        {
-                            info.handler(call, data->async, info.context, httpSingleton->m_performEnv.get());
-                        }
-                        catch (...)
-                        {
-                            if (call->traceCall) { HC_TRACE_ERROR(HTTPCLIENT, "HCHttpCallPerform [ID %llu]: failed", static_cast<HC_CALL*>(call)->id); }
-                        }
-                    }
-                }
-
-                return E_PENDING;
+                return E_HC_NOT_INITIALISED;
             }
 
-            default: return S_OK;
+            return aw.ScheduleOnQueueAfter(call->delayBeforeRetry);
         }
-    });
 
-    if (SUCCEEDED(hr))
-    {
-        uint32_t delayInMilliseconds = static_cast<uint32_t>(call->delayBeforeRetry.count());
-        hr = XAsyncSchedule(asyncBlock, delayInMilliseconds);
-    }
+        static HRESULT DoWork(HCCallHandle call, AsyncWrapper& aw)
+        {
+            auto httpSingleton = get_http_singleton(false);
+            if (nullptr == httpSingleton)
+            {
+                return E_HC_NOT_INITIALISED;
+            }
 
-    return hr;
+            bool matchedMocks = false;
+
+            matchedMocks = Mock_Internal_HCHttpCallPerformAsync(call);
+            if (matchedMocks)
+            {
+                return aw.Succeed();
+            }
+            else // if there wasn't a matched mock, then real call
+            {
+                HttpPerformInfo const& info = httpSingleton->m_httpPerform;
+                if (info.handler == nullptr)
+                {
+                    assert(false);
+                    return E_UNEXPECTED;
+                }
+
+                info.handler(call, aw.GetRaw(), info.context, httpSingleton->m_performEnv.get());
+                return aw.MarkWaitingOnCallback();
+            }
+        }
+    };
+
+    return Runner::Run(reinterpret_cast<void*>(perform_http_call), __FUNCTION__, asyncBlock, call);
 }
 
 void clear_http_call_response(_In_ HCCallHandle call)
@@ -327,141 +799,6 @@ bool should_fast_fail(
     }
 }
 
-
-class HcCallWrapper
-{
-public:
-    HcCallWrapper(_In_ HC_CALL* call)
-    {
-        assert(call != nullptr);
-        if (call != nullptr)
-        {
-            m_call = HCHttpCallDuplicateHandle(call);
-        }
-    }
-
-    ~HcCallWrapper()
-    {
-        if (m_call)
-        {
-            HCHttpCallCloseHandle(m_call);
-        }
-    }
-
-    HC_CALL* get()
-    {
-        return m_call;
-    }
-
-private:
-    HC_CALL* m_call{ nullptr };
-};
-
-typedef struct retry_context
-{
-    std::shared_ptr<HcCallWrapper> call;
-    XAsyncBlock* outerAsyncBlock;
-    XTaskQueueHandle outerQueue;
-} retry_context;
-
-void retry_http_call_until_done(
-    _In_ retry_context* retryContext
-    )
-{
-    auto httpSingleton = get_http_singleton(false);
-    if (nullptr == httpSingleton)
-    {
-        XAsyncComplete(retryContext->outerAsyncBlock, S_OK, 0);
-    }
-
-    auto requestStartTime = chrono_clock_t::now();
-    HC_CALL* call = retryContext->call->get();
-    if (call->retryIterationNumber == 0)
-    {
-        call->firstRequestStartTime = requestStartTime;
-    }
-    call->retryIterationNumber++;
-    if (call->traceCall) { HC_TRACE_INFORMATION(HTTPCLIENT, "HCHttpCallPerformExecute [ID %llu] Iteration %d", call->id, call->retryIterationNumber); }
-
-    http_retry_after_api_state apiState = httpSingleton->get_retry_state(call->retryAfterCacheId);
-    if (apiState.statusCode >= 400)
-    {
-        bool clearState = false;
-        if (should_fast_fail(apiState, call, requestStartTime, &clearState))
-        {
-            HCHttpCallResponseSetStatusCode(call, apiState.statusCode);
-            if (call->traceCall) { HC_TRACE_INFORMATION(HTTPCLIENT, "HCHttpCallPerformExecute [ID %llu] Fast fail %d", call->id, apiState.statusCode); }
-            XAsyncComplete(retryContext->outerAsyncBlock, S_OK, 0);
-            return;
-        }
-
-        if( clearState )
-        {
-            httpSingleton->clear_retry_state(call->retryAfterCacheId);
-        }
-    }
-
-    XTaskQueueHandle nestedQueue = nullptr;
-    if (retryContext->outerQueue != nullptr)
-    {
-        XTaskQueuePortHandle workPort;
-        XTaskQueueGetPort(retryContext->outerQueue, XTaskQueuePort::Work, &workPort);
-        XTaskQueueCreateComposite(workPort, workPort, &nestedQueue);
-    }
-    XAsyncBlock* nestedBlock = new XAsyncBlock{};
-    nestedBlock->queue = nestedQueue;
-    nestedBlock->context = retryContext;
-
-    nestedBlock->callback = [](XAsyncBlock* nestedAsyncBlock)
-    {
-        auto httpSingleton = get_http_singleton(false);
-        if (nullptr == httpSingleton)
-        {
-            HC_TRACE_WARNING(HTTPCLIENT, "Http completed after HCCleanup was called. Aborting call.");
-            return;
-        }
-
-        auto callStatus = XAsyncGetStatus(nestedAsyncBlock, false);
-
-        retry_context* retryContext = static_cast<retry_context*>(nestedAsyncBlock->context);
-        auto responseReceivedTime = chrono_clock_t::now();
-
-        uint32_t timeoutWindowInSeconds = 0;
-        HC_CALL* call = retryContext->call->get();
-        HCHttpCallRequestGetTimeoutWindow(call, &timeoutWindowInSeconds);
-
-        if (nestedAsyncBlock->queue != nullptr)
-        {
-            XTaskQueueCloseHandle(nestedAsyncBlock->queue);
-        }
-        delete nestedAsyncBlock;
-
-        if (SUCCEEDED(callStatus) && http_call_should_retry(call, responseReceivedTime))
-        {
-            if (call->traceCall) { HC_TRACE_INFORMATION(HTTPCLIENT, "HCHttpCallPerformExecute [ID %llu] Retry after %lld ms", call->id, call->delayBeforeRetry.count()); }
-            std::lock_guard<std::recursive_mutex> lock(httpSingleton->m_callRoutedHandlersLock);
-            for (const auto& pair : httpSingleton->m_callRoutedHandlers)
-            {
-                pair.second.first(call, pair.second.second);
-            }
-
-            clear_http_call_response(call);
-            retry_http_call_until_done(retryContext);
-        }
-        else
-        {
-            XAsyncComplete(retryContext->outerAsyncBlock, callStatus, 0);
-        }
-    };
-
-    HRESULT hr = perform_http_call(httpSingleton, call, nestedBlock);
-    if (FAILED(hr))
-    {
-        XAsyncComplete(retryContext->outerAsyncBlock, hr, 0);
-        return;
-    }
-}
-
 STDAPI 
 HCHttpCallPerformAsync(
     _In_ HCCallHandle call,
@@ -477,57 +814,149 @@ try
     if (call->traceCall) { HC_TRACE_INFORMATION(HTTPCLIENT, "HCHttpCallPerform [ID %llu]", call->id); }
     call->performCalled = true;
 
-    std::shared_ptr<retry_context> retryContext = std::make_shared<retry_context>();
-    retryContext->call = std::make_shared<HcCallWrapper>(static_cast<HC_CALL*>(call)); // RAII will keep the HCCallHandle alive during HTTP call
-    retryContext->outerAsyncBlock = asyncBlock;
-    retryContext->outerQueue = asyncBlock->queue;
-    retry_context* rawRetryContext = static_cast<retry_context*>(shared_ptr_cache::store<retry_context>(retryContext));
-    if (rawRetryContext == nullptr)
+    class Runner : public AsyncRunnableBase<Runner, void>
     {
-        HCHttpCallCloseHandle(call);
-        return E_HC_NOT_INITIALISED;
-    }
-
-    HRESULT hr = XAsyncBegin(asyncBlock, rawRetryContext, reinterpret_cast<void*>(HCHttpCallPerformAsync), __FUNCTION__,
-        [](_In_ XAsyncOp op, _In_ const XAsyncProviderData* data)
-    {
-        auto httpSingleton = get_http_singleton(false);
-        if (nullptr == httpSingleton)
+    public:
+        Runner(HCCallHandle call, XTaskQueueHandle queue) noexcept:
+            m_call{ call }, m_queue{ queue }, m_nestedQueue{ nullptr }
         {
-            return E_HC_NOT_INITIALISED;
+            assert(m_call);
+            HCHttpCallDuplicateHandle(m_call);
         }
 
-        switch (op)
+        ~Runner()
         {
-            case XAsyncOp::DoWork:
-                retry_http_call_until_done(static_cast<retry_context*>(data->context));
-                return E_PENDING;
-
-            case XAsyncOp::GetResult:
-                break;
-
-            case XAsyncOp::Cancel:
-                break;
-
-            case XAsyncOp::Cleanup:
+            if (m_nestedQueue)
             {
-                shared_ptr_cache::remove(data->context);
-                break;
+                XTaskQueueCloseHandle(m_nestedQueue);
             }
-                
-            default:
-                break;
+            HCHttpCallCloseHandle(m_call);
         }
 
-        return S_OK;
-    });
+        HRESULT Begin()
+        {
+            return ScheduleOnQueue();
+        }
 
-    if (hr == S_OK)
-    {
-        hr = XAsyncSchedule(asyncBlock, 0);
-    }
+        HRESULT DoWork()
+        {
+            auto httpSingleton = get_http_singleton(false);
+            if (nullptr == httpSingleton)
+            {
+                // todo only fail the first time
+                return E_HC_NOT_INITIALISED;
+            }
 
-    return hr;
+            auto requestStartTime = chrono_clock_t::now();
+            if (m_call->retryIterationNumber == 0)
+            {
+                m_call->firstRequestStartTime = requestStartTime;
+            }
+            m_call->retryIterationNumber++;
+            if (m_call->traceCall)
+            {
+                HC_TRACE_INFORMATION(HTTPCLIENT, "HCHttpCallPerformExecute [ID %llu] Iteration %d", m_call->id, m_call->retryIterationNumber);
+            }
+
+            http_retry_after_api_state apiState = httpSingleton->get_retry_state(m_call->retryAfterCacheId);
+            if (apiState.statusCode >= 400)
+            {
+                bool clearState = false;
+                if (should_fast_fail(apiState, m_call, requestStartTime, &clearState))
+                {
+                    HCHttpCallResponseSetStatusCode(m_call, apiState.statusCode);
+                    if (m_call->traceCall)
+                    {
+                        HC_TRACE_INFORMATION(HTTPCLIENT, "HCHttpCallPerformExecute [ID %llu] Fast fail %d", m_call->id, apiState.statusCode);
+                    }
+                    return Succeed();
+                }
+
+                if (clearState)
+                {
+                    httpSingleton->clear_retry_state(m_call->retryAfterCacheId);
+                }
+            }
+
+            if (m_nestedQueue == nullptr && m_queue != nullptr)
+            {
+                XTaskQueuePortHandle workPort;
+                XTaskQueueGetPort(m_queue, XTaskQueuePort::Work, &workPort);
+                XTaskQueueCreateComposite(workPort, workPort, &m_nestedQueue);
+            }
+
+            auto nestedBlock = std::make_unique<XAsyncBlock>();
+            nestedBlock->queue = m_nestedQueue;
+            nestedBlock->context = this;
+
+            nestedBlock->callback = [](XAsyncBlock* nestedAsyncBlockPtr)
+            {
+                std::unique_ptr<XAsyncBlock> nestedAsyncBlock{ nestedAsyncBlockPtr };
+                Runner* self = static_cast<Runner*>(nestedAsyncBlock->context);
+                self->InnerAsyncCallback();
+            };
+
+            HRESULT hr = perform_http_call(httpSingleton, m_call, nestedBlock.get());
+            if (FAILED(hr))
+            {
+                return hr;
+            }
+
+            nestedBlock.release();
+            return MarkWaitingOnCallback();
+        }
+
+        void InnerAsyncCallback() noexcept
+        try
+        {
+            auto httpSingleton = get_http_singleton(false);
+            if (nullptr == httpSingleton)
+            {
+                HC_TRACE_WARNING(HTTPCLIENT, "Http completed after HCCleanup was called. Aborting call.");
+                return;
+            }
+
+            auto responseReceivedTime = chrono_clock_t::now();
+
+            uint32_t timeoutWindowInSeconds = 0;
+            HCHttpCallRequestGetTimeoutWindow(m_call, &timeoutWindowInSeconds);
+
+            if (http_call_should_retry(m_call, responseReceivedTime))
+            {
+                if (m_call->traceCall)
+                {
+                    HC_TRACE_INFORMATION(HTTPCLIENT, "HCHttpCallPerformExecute [ID %llu] Retry after %lld ms", m_call->id, m_call->delayBeforeRetry.count());
+                }
+                std::lock_guard<std::recursive_mutex> lock(httpSingleton->m_callRoutedHandlersLock);
+                for (const auto& pair : httpSingleton->m_callRoutedHandlers)
+                {
+                    pair.second.first(m_call, pair.second.second);
+                }
+
+                clear_http_call_response(m_call);
+                ScheduleOnQueue();
+            }
+
+            Succeed();
+        }
+        catch (...) // needs good catch into setup
+        {
+            Fail(E_FAIL);
+        }
+
+    private:
+        HCCallHandle const m_call;
+        XTaskQueueHandle const m_queue;
+        XTaskQueueHandle m_nestedQueue;
+    };
+
+    return Runner::MakeAndRun(
+        reinterpret_cast<void*>(HCHttpCallPerformAsync),
+        __FUNCTION__,
+        asyncBlock,
+        call,
+        asyncBlock->queue
+    );
 }
 CATCH_RETURN()
 
